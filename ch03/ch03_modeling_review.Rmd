@@ -1,0 +1,82 @@
+---
+title: "Ch3: Review of R modeling fundamentals"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+The code chunks below follow the example in the text book to model cricket data.
+
+```{r EDA}
+# Setup
+library(tidyverse, patchwork, MASS)
+data(crickets, package = "modeldata")
+
+# EDA
+ggplot(crickets, aes(temp, rate, color = species, shape = species)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE, method = "lm") + 
+  labs(x = "Temperature (C)", y = "Chirps per minute")
+
+```
+```{r modeling}
+# Fit model with interaction term
+(interaction_fit <- lm(rate ~ temp * species, data = crickets))
+
+# Create diagnostic plots
+p1 <- data.frame(fitted_val = fitted(interaction_fit), 
+           resid = residuals(interaction_fit)) %>% 
+  ggplot(aes(fitted_val, resid)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") + 
+  geom_smooth(se = FALSE, color = "red") + 
+  labs(x = "Fitted values", y = "Residuals")
+
+(p2 <- data.frame(std_resid = MASS::stdres(interaction_fit)) %>% 
+    ggplot(aes(sample = std_resid)) + 
+    stat_qq() + 
+    stat_qq_line(linetype = "dashed") + 
+    labs(x = "Theoretical quantiles", y = "Standardized residuals")) 
+
+patchwork::wrap_plots(p1, p2) + 
+  patchwork::plot_annotation(title = "Diagnostic modeling plots for cricket data")
+
+# There is some non-linear behavior in the QQ-plot, but overall this looks okay
+# Ther are also some values that are not accurately modeled by the linear regression, as seen in the residuals vs fitted plot
+```
+
+```{r anova for model comparisons}
+# Fit the model with just the main effects, no interaction
+main_effect_fit <- lm(rate ~ temp + species, data = crickets)
+
+# Compare
+anova(main_effect_fit, interaction_fit)
+
+# Based on the p-value of 0.25, there's no evidence that including the interaction term improves model fit
+# For this reason, we'll exclude it from subsequent models
+```
+
+```{r summary of main effects}
+summary(main_effect_fit)
+
+# The model indicates that a one unit increase in temperature is associated with 3.6 chirps per minute, on average, holding all other factors constant
+# Additionally, the model indicates that O. niveus is associated with 10 chirps less per minute, on average, compared to the other species
+# Both terms are statistically significant (p-value < 0.05)
+
+```
+
+This next code chunk illustrates the power and simplicity of the `broom::tidy()` function.
+
+```{r tidy correlation}
+corr_res <- map(mtcars %>% select(-mpg), cor.test, y = mtcars$mpg)
+corr_res %>% 
+  map_df(broom::tidy, .id = "predictor") %>% # apply tidy function to create tibble, then bind rows in each
+  ggplot(aes(fct_reorder(predictor, estimate))) + 
+  geom_point(aes(y = estimate)) + 
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1) + 
+  labs(x = "Correlation with mpg", y = "Estimate",
+       title = "Correlation results in mtcars")
+```
+

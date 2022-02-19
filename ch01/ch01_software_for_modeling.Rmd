@@ -1,0 +1,32 @@
+---
+title: "Ch1: Software for modeling"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Notes
+
+Introduction: 
+
+* Ultimately, models describe systems and help us understand the relationships in data.
+* At the core of the design philosophy of tidy models is helping users perform analyses with good statistical practice within a standardized ecosystem of packages that operate together, use the same data structures, and integrate seamlessly with other data science ecosystems (e.g., tidyverse).
+
+Types of models:
+
+* Descriptive models are generally used to identify and communicate trends in data (e.g., fuel efficiency by vehicle weight or horsepower, etc).
+* LOESS = locally estimated scatterplot smoothing model, a flexible regression method that's typically used in plotting to identify non-linear associations between variables.
+* In contrast to descriptive models, inferential models are used to make decisions (e.g., classification, spend money on this research arm but not that one, etc) or make general conclusions in hypothesis tests (e.g., vehicle horsepower has a significant effect on the mean fuel efficiency, but vehicle color does not, etc).
+* To appropriately produce and interpret the intended output of inferential models, it's important to keep in mind that many modeling approaches make explicit assumptions about the underlying data (e.g., the data are derived from a specific distribution).
+* In other situations, we are more interested in building models that produce the most accurate predictions for new data, and are not as concerned with understanding the relationship between variables in the data.
+* Mechanistic predictive models are created by building equations given what we know about a particular system and collecting data to estimate the equation's unknown parameters.
+* Empirically driven models are created by learning relationships and rules between features and outcomes in data.
+* Although there are often differences in the end goals for inferential and predictive models, it's important that the predictive ability of infernetial models not be ignored when evaluating model performance and communicating results.  
+
+Terminology:
+
+* Within the domain of supervised modeling, regression predicts numeric outcomes, while classification predicts qualitative outcomes.
+* The modeling process is iterative, often taking multiple rounds of evaluating, feature engineering, tuning, and refining.
+
