@@ -1,0 +1,65 @@
+---
+title: "Ch5: Spending our data"
+output: 
+  html_notebook:
+    theme: cerulean
+---
+
+A key consideration for modeling is how the data should be spent- that is, how should we allocate different subsets of the data to the process of feature selection, parameter estimation, and finally evaluating model performance.  First, let's set up the notebook.
+
+```{r notebook setup}
+# Setup
+library(tidyverse, tidymodels)
+
+# Prepare input data
+data(ames, package = "modeldata")
+ames <- ames %>% mutate(Sale_Price = log10(Sale_Price))
+```
+
+Often, the data are initially split into training and test sets- it's important to stress that the training set is where features are selected, model parameters are estimated, model hyperparameters tuned, and refined models are selected.  The test set held out at the beginning of the analysis can only be seen once by the model at the end of the process to avoid bias.  We'll split the Ames housing data into training and test sets using 80% of the original data for the former and 20% for the latter using.
+
+```{r split Ames data}
+# Split data
+set.seed(123)
+(ames_split <- initial_split(ames, prop = 0.80))
+
+# We can extract training and testing sets using the functions below
+(ames_train <- training(ames_split))
+(ames_test <- testing(ames_split))
+
+```
+
+When randomly sampling data from the original set into training and test sets, it's important to set the seed for quasi-random number generation to reproduce results later.  In addition, if there are highly imbalanced classes in the data, stratified random sampling would be more appropriate to ensure that the relative proportions of each class are maintained in the training and test sets.  In the classification setting, this is relative straightforward- say there are 10% positives and 90% negatives in the original data.  Splitting the data into training and test sets by stratified random sampling will maintain these relative proportions in both the training and test sets.  In the regression setting where the outcome variable is quantitative, stratifying the training and test sets into quartiles of the outcome variable is used.  In the Ames housing data, we're trying to predict the sale price (a quantitative outcome), so we'll stratify the splitting into training and test data by the quartiles of the sale price.
+
+```{r split by quartiles}
+# Split data 
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = Sale_Price)
+
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+# Plot distribution of sale price in training and test sets and annotate with quartiles
+combined_ames <- ames_train %>% 
+  mutate(type = "training") %>% 
+  bind_rows(ames_test %>% mutate(type = "testing"))
+
+ames_quantiles <- combined_ames %>% 
+  group_by(type) %>% 
+  summarise(quantiles = quantile(Sale_Price))
+
+# Plot
+combined_ames %>% 
+  left_join(ames_quantiles, by = "type") %>% 
+  ggplot(aes(Sale_Price)) + 
+  geom_histogram(bins = 40) + 
+  geom_vline(aes(xintercept = quantiles), linetype = "dashed") +
+  facet_wrap(~type, nrow = 2)
+
+```
+
+There is not a cut and dry threshold for deciding what proportion of the original data should be included in the training set and held out for final testing.  There is an inherent trade-off between not feeding the model enough examples (e.g., the training proportion is too low) and not having enough data in the test set to evaluate performance (e.g., training the model on too many examples).  It's also important to consider that within the training set, we can hold out another subset of data to train the model and then simulate how the model might perform on unseen data using that holdout set from the training data- this is referred to as the validation set.  Another important consideration is the topic of information leakage as it pertains to information "leaking" out of the test set during the modeling process.  This is critical, because ultimately we want a model that will perform well when seeing new data, and the test set represents data that we are likely to encounter if we were to go out an collect another sample from the same or similar population.  
+
+
+
+
