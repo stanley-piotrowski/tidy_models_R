@@ -1,0 +1,84 @@
+---
+title: "Ch7: A model workflow"
+output:
+  html_notebook:
+    theme: cerulean
+---
+
+This section focuses on building modeling workflows, which bundle the pre-processing of data and defining model specifications into a single step to aid in organization.  First, let's set up the libraries and data we'll need for the notebook.
+
+```{r notebook setup}
+# Libraries
+library(pacman)
+p_load(tidyverse, tidymodels, patchwork, broom)
+
+# Prepare input data
+data(ames, package = "modeldata")
+ames <- ames %>% mutate(Sale_Price = log10(Sale_Price))
+
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = Sale_Price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+# Build the linear regression model specification 
+lm_mod <- linear_reg() %>% 
+  set_engine("lm")
+```
+
+In addition to pre-processing, the model workflow helps to organize post-processing steps that may be required to evaluate and optimize model fit, like optimizing the probability cutoff for classification problems.  Now we'll build the workflow object, add the linear regression model specification we defined above, and add a model formula.
+
+```{r workflow basics}
+# Build the workflow
+(lm_workflow <- 
+  workflow() %>% 
+  add_model(lm_mod) %>% 
+  add_formula(Sale_Price ~ Longitude + Latitude))
+
+# Fit the model with the workflow
+(lm_fit <- fit(lm_workflow, ames_train))
+
+# We can easily update the formula in the workflow
+lm_fit %>% 
+  update_formula(Sale_Price ~ Longitude)
+```
+
+Instead of passing a formula to the workflow, we can add variables explicitly using `add_variables()`.
+
+```{r add variables without formula}
+(lm_workflow <- lm_workflow %>% 
+  remove_formula() %>% 
+  add_variables(outcome = Sale_Price, predictors = c(Latitude, Longitude)))
+
+```
+
+If we want to build a series of models to evaluate model fit with different predictions, we can use workflow sets, as illustrated below.
+
+```{r workflow sets}
+# Define list of variables
+location <- list(
+  longitude = Sale_Price ~ Longitude,
+  latitude = Sale_Price ~ Latitude,
+  coords = Sale_Price ~ Latitude + Longitude,
+  neighborhood = Sale_Price ~ Neighborhood
+)
+
+# Build workflow set with the locations and linear model specification
+(location_models <- workflow_set(preproc = location, models = list(lm = lm_mod)))
+
+```
+
+We can extract individual workflows using the `extract_workflow()` function.
+
+```{r extract workflow from set}
+extract_workflow(location_models, id = "coords_lm")
+```
+
+Now we'll fit each model and look at he results.
+
+```{r fit location models}
+(location_models <- location_models %>% 
+  mutate(fit = map(info, ~ fit(.x$workflow[[1]], ames_train))))
+
+```
+
