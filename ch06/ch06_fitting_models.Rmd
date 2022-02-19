@@ -1,0 +1,81 @@
+---
+title: "Ch6: Fitting models with parsnip"
+output:
+  html_notebook:
+    theme: cerulean
+---
+
+This chapter focuses on fitting models and making predictions using the `parsnip()` package.  First, let's set up the notebook by loading all required libraries, data sets, and performing the log10 transformation on the housing data sale price.
+
+```{r notebook setup}
+# Libraries
+library(pacman)
+p_load(tidyverse, tidymodels, patchwork, broom)
+
+# Prepare housing data
+data(ames, package = "modeldata")
+ames <- ames %>% mutate(Sale_Price = log10(Sale_Price))
+```
+
+If we were to try and build different models using base R functions, or even other implementations like `glmnet` to fit penalized regression models, we'd need to transform the data in different ways to satisfy the input requirements for each modeling function.  The `parsnip` package aims to simplify this process by specifying models that take a few key components: i) the type of model to be used (e.g., linear regression or random forest); ii) the engine, or functions needed to actually perform the modeling; and iii) the type of output.  Importantly, all of these features can be bundled into an object that doesn't reference the data, so these can easily be applied to different data sets if needed.  Below, we'll build differnet `parsnip` model objects and use the `translate()` function to see how the different components of the object are used in building the model.
+
+```{r translate parsnip}
+# Build linear regression model
+linear_reg() %>% 
+  set_engine("lm") %>% 
+  translate()
+
+```
+
+We can see that the specification is for a linear model with the `lm` computational engine- this is translated to using the `stats::lm()` function, with empty placeholders for arguments passed to the model.  Below we'll build a regression model that only uses latitude and longitude to predict the sale price.
+
+```{r lat lon regression model}
+# Build the parsnip model object
+lm_model <- linear_reg("regression") %>% 
+  set_engine("lm")
+
+# Fit the model object to the data
+(lm_form_fit <- lm_model %>% 
+  fit(Sale_Price ~ Longitude + Latitude, data = ames_train))
+```
+
+One of the main goals of `parsnip` is to limit the number of arguments to memorize across different engines and to make the argument names more intuitive for a broader audience.  However, engine-specific arguments can still be applied in the `set_engine()` call.  For example, the `ranger()` implementation of random forest models includes parallel processing capabilities, which isn't included as a common argument in other random forest packages, so we would set the parallel processing argument in the call `set_engine("ranger", num.threads = 10)` or something similar.  
+
+We can extract the results of the linear regression model in a standardized, tidy format using the `broom` package.
+
+```{r extract regression results}
+tidy(lm_form_fit)
+
+```
+
+Continuing with the theme of predictability and consistency, `parsnip` also includes standardized ways of formatting predicts from the `predict()` function.  We can predict the sales price of a small subset of the test data and print both the integer prediction as well as the prediction interval around the point estimate.
+
+```{r predictions}
+# Subset test data to predict
+ames_test_small <- ames_test %>% slice(1:5)
+
+# Make predictions
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(lm_form_fit, new_data = ames_test_small)) %>% 
+  bind_cols(predict(lm_form_fit, new_data = ames_test_small, type = "pred_int"))
+```
+
+The beauty of the tidymodels approach is that outside of the model specification, fitting the model to data and making predictions is exactly the same.  Further, any missing values are recorded as missing, so there is no ambiguity when the predictions are merged with the original data.  To demonstrate, we'll fit a decision tree to the same data set, using the regression mode.
+
+```{r fit random forest}
+# Define model specification
+(tree_mod <- decision_tree(min_n = 2) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression"))
+
+# Fit model
+(tree_fit <- tree_mod %>% 
+  fit(Sale_Price ~ Latitude + Longitude, data = ames_train))
+
+# Predict
+ames_test_small %>% 
+  select(Sale_Price) %>% 
+  bind_cols(predict(tree_fit, new_data = ames_test_small))
+```
+
