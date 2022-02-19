@@ -1,0 +1,62 @@
+---
+title: "Ch4: Ames housing data"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+Ultimately, we want to predict the price of a home based on various predictors in the `ames` housing data. 
+
+```{r notebook setup}
+library(tidymodels, tidyverse, patchwork)
+
+# Load housing data
+data(ames, package = "modeldata")
+ames
+
+```
+
+Perform some EDA.
+
+```{r ames EDA}
+# Look at different binwidths for the distribution of housing price
+map(c(30, 40, 50, 60), ~ ggplot(ames, aes(Sale_Price)) + 
+      geom_histogram(bins = .x) + 
+      geom_vline(aes(xintercept = median(Sale_Price)), 
+                     linetype = "dashed", color = "red") + 
+      labs(title = paste0("Bin width: ", .x))) %>% 
+  wrap_plots() + 
+  plot_annotation(title = "Distribution of sale price in Ames, Iowa housing data", 
+                  subtitle = "Median sale price shown as a vertical red dashed line")
+
+```
+
+Across different binwidths, we can see the sales price data are right-skewed.  We can also see this by looking at a QQ-plot of the data on the original scale, and the data transformed on the log scale.
+
+```{r}
+ames %>% 
+  select(Sale_Price) %>% 
+  mutate(Log_Sale_Price = log10(Sale_Price)) %>% 
+  pivot_longer(cols = everything(), names_to = "type", values_to = "value") %>% 
+  ggplot(aes(sample = value)) + 
+  stat_qq(alpha = 0.2) + 
+  stat_qq_line(linetype = "dashed") + 
+  facet_wrap(~ type, scales = "free") + 
+  labs(x = "Theoretical quantiles", 
+       y = "Sample quantiles") +
+  plot_annotation(title = "Log transformation reduces skew in sale price")
+```
+
+Since the log-transformation reduces skew in the data, we'll add a new predictor to log10 transform the sale price.
+
+```{r}
+# Apply log10 transformation
+ames <- mutate(ames, Sale_Price = log10(Sale_Price))
+
+```
+
+We'll use the `ames` data set with the log10 transformed sale price moving forward.
+
+
