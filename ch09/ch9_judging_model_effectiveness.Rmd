@@ -1,0 +1,143 @@
+---
+title: "Ch9: Judging model effectiveness"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Introduction and setup
+
+This chapter focuses on different methods to empirically validate model performance.  The authors note that the best way to empirically validate a model is through re-sampling techniques, which split the training data into analysis and assessment sets and evaluate model fit on the assessment sets.  Importantly, the test set is used once, and only once.
+
+```{r notebook setup}
+# Libraries
+library(pacman)
+p_load(tidyverse, tidymodels, broom, patchwork, splines)
+
+# Load data
+data(ames, package = "modeldata")
+(ames <- ames %>% 
+  clean_names() %>% 
+  mutate(sale_price = log10(sale_price)))
+
+# Split
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+# Load recipe, workflow, and fit
+ames_recipe <- readRDS("../data/ames_recipe.Rds")
+lm_workflow <- readRDS("../data/ames_lm_workflow.Rds")
+lm_fit <- readRDS("../data/ames_lm_fit.Rds")
+```
+
+The two most commonly used metrics for evaluating regression model performance are the root mean squared error (RMSE) and the coefficient of determination.  The former measures accuracy, while the latter measures the correlation between the observed and predicted values.  Additionally, the former tends to have more variability than the latter, but in general, it is accurate across the range of outcomes.  The lattter tends to have a better fit, but tends to have higher errors in the tails of the outcome values.
+
+It's important to note that the methods and strategies presented in this chapter are focused on predictive models, but these should also be used for inferential models as well.  The basic idea is that if sequential hypothesis testing during inferential model development produces a set of predictors that are significant to interpret, we should also make sure that the predictions from that model are accurate.  
+
+To review, the RMSE is the standard deviation of the residuals, or the differences between the observed data and the predictions.  The coefficient of determination is essentially the proportion of the variance in the data that is explained by the regression model.  It's calculated by dividing the sum of squared errors (observed - predicted, squared) by the total sums of squares (observation divided by the mean), all subtracted from one.  
+
+## Regression metrics
+
+Produce predictions for the test set using the previously fitted linear model with the interaction terms and splines.
+
+```{r linear mod predictions}
+(ames_test_res <- predict(
+  lm_fit, 
+  new_data = ames_test %>% select(-sale_price)
+  ) %>% 
+   bind_cols(ames_test %>% select(sale_price)))
+
+# Plot
+ggplot(ames_test_res, aes(sale_price, .pred)) + 
+  geom_abline(linetype = "dashed") +
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred()
+```
+
+```{r calculate RMSE}
+rmse(ames_test_res, truth = sale_price, estimate = .pred)
+```
+We can also get the values for a series of metrics.
+
+```{r get metric set}
+# Define metric size
+(ames_metrics <- metric_set(rmse, rsq, mae))
+
+ames_metrics(ames_test_res, truth = sale_price, estimate = .pred)
+```
+
+These metrics show that the RMSE for the model is approximately 0.07, while the coefficient of determination, or the proportion of the variance in the data that's explained by the model, is approximately 0.8.   
+
+## Binary classification metrics
+
+To explore different metrics for binary classification problems, we'll use the `two_class_example` data set.  This tibble contains the true outcomes for two classes, `Class1` and `Class2`, the predicted probabilities for a given observation belonging to each class, and the predicted class label.
+
+```{r load class example}
+data(two_class_example, package = "modeldata")
+str(two_class_example)
+
+```
+
+```{r yardstick functions}
+# Generate confusion matrix
+conf_mat(two_class_example, truth = truth, estimate = predicted)
+
+# Accuracy
+accuracy(two_class_example, truth = truth, estimate = predicted)
+
+# Matthew correlation coefficient-- this essentially uses the confusion matrix to take into account all of the true negatives and positives, as well as false negatives and positives, as a summary statistic to measure overall performance of the prediction method
+mcc(two_class_example, truth = truth, estimate = predicted)
+
+# F1 metric, or F1 score-- takes into account the precision (true positives / true positives + false positives) and the recall (true positives / true positives + false negatives)
+f_meas(two_class_example, truth = truth, predicted)
+
+# If the event (i.e., positive) is the second class, not the first
+f_meas(two_class_example, truth, predicted, event_level = "second")
+```
+
+Compute the ROC curve and the area under the ROC curve (AUC).
+
+```{r roc and auc}
+# ROC uses predicted probabilities, not hard class labels
+(two_class_curve <- roc_curve(two_class_example, truth, Class1))
+
+# AUC
+roc_auc(two_class_example, truth, Class1)
+
+# Plot
+autoplot(two_class_curve) + 
+  ggtitle(paste0("AUC: ", roc_auc(two_class_example, truth, Class1) %>% 
+                   pluck(".estimate") %>% 
+                   round(2)))
+
+```
+
+## Multi-class classification metrics
+
+In this section, we'll use the `hpc_cv` data set, which cotains the predicted class and probabilities for multiple classes.  
+
+```{r multiclass data}
+data("hpc_cv")
+str(hpc_cv)
+```
+
+Use the same functions for evaluating multiclass predictions- the only thing that will change is the `.estimator` column.
+
+```{r multiclass metrics}
+accuracy(hpc_cv, obs, pred); mcc(hpc_cv, obs, pred)
+```
+
+The standard metrics used for binary problems like sensitivity and specificity can be extended to multi-class problems using macro-averaging, macro-weighting, and micro-averaging passed as arguments to the specific function.  For this data set, we can compute the ROC curves for 1 versus all classes by each re-sample.  For example, if we are interested in the sensitivity of predicted `VF`, the data for the other classes are combined to produce the pseudo second class, and sensitivity is calculated as normal.  
+```{r 1 vs all ROC}
+# Calculate roc curve and plot
+hpc_cv %>% 
+  group_by(Resample) %>% 
+  roc_curve(obs, VF, F, M, L) %>% 
+  autoplot()
+
+```
+
