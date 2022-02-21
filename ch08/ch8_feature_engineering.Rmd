@@ -1,0 +1,199 @@
+---
+title: "Ch8: Feature engineering with recipes"
+output:
+  html_notebook:
+    theme: cerulean
+---
+
+This chapter focuses on feature engineering, the process of reformatting predictors to be used in the modeling process.  This could be as simple as taking the ratio of two predictors to be used in the model, or by using another process like PCA to extract most of the meaningful variation from correlated predictors.  
+
+```{r notebook setup}
+# Libraries
+library(pacman)
+p_load(tidyverse, tidymodels, broom, patchwork, janitor, splines)
+
+# Read in the housing data and transform sale price
+data(ames, package = "modeldata")
+(ames <- ames %>% 
+  mutate(Sale_Price = log10(Sale_Price)) %>% 
+  clean_names())
+
+# Split
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+```
+
+
+Now we'll focus on a subset of the predictors in the Ames housing data.  Let's get an idea of what their distributions look like.  
+
+```{r predictor distributions}
+# Build histograms
+(p1 <- ggplot(ames, aes(year_built)) + 
+  geom_histogram(bins = 40))
+
+(p2 <- ggplot(ames, aes(gr_liv_area)) + 
+  geom_histogram(bins = 40))
+
+# Barplots
+(p3 <- ggplot(ames, aes(neighborhood)) + 
+    geom_bar() + 
+    coord_flip())
+
+(p4 <- ggplot(ames, aes(bldg_type)) + 
+  geom_bar())
+
+# Summarize
+(p1 + p2) / (p4 + p3)
+```
+
+From these plots, the gross above-grade living area (`Gr_Liv_Area`) is right-skewed, thus an ordinary least squares regression model may benefit from applying a log transformation to this predictor.  This preprocessing step, as well as the transformation of the remaining categorical variables into numeric variables to build the model matrix, could be accomplished by the formula in the generic linear model function call.  However, we can bundle this pre-processing into a recipe for what "should be done" during the modeling process.
+
+```{r simple ames recipe}
+(simple_ames_recipe <- recipe(
+  sale_price ~ neighborhood + gr_liv_area + year_built + bldg_type,
+  data = ames_train
+) %>% 
+  step_log(gr_liv_area, base = 10) %>% # log transformation
+  step_dummy(all_nominal_predictors())) # create dummy vars for all strings
+
+```
+
+One of the benefits of using this approach is that the recipe can be applied to different models without having to either: a) modify the original data; or b) explicitly define complex transformations for each model.  
+
+```{r add recipe to workflow}
+# Define model spec
+(lm_mod <- linear_reg() %>% 
+  set_engine("lm"))
+
+# Build workflow
+(lm_workflow <- workflow() %>% 
+    add_model(lm_mod) %>% 
+    add_recipe(simple_ames_recipe))
+
+```
+
+Now all of the pre-processing can be done by fitting the workflow and the training data.
+
+```{r fit and predict}
+(lm_fit <- fit(lm_workflow, ames_train))
+predict(lm_fit, new_data = ames_test) %>% 
+  slice(1:3)
+
+# Extract fitted model estimates
+lm_fit %>% 
+  extract_fit_parsnip() %>% 
+  tidy() %>% 
+  slice(1:5)
+```
+
+Let's add a new step to the recipe- we want to basically catch all of the infrequently occurring neighborhoods into a single factor level "other."  This can be accomplished in a single step with the `step_other()` function.  We can see the results of the ammended recipe below.  
+
+```{r ammend recipe}
+(simple_ames_recipe <- recipe(
+  sale_price ~ neighborhood + gr_liv_area + year_built + bldg_type, 
+  data = ames_train
+) %>% 
+  step_log(gr_liv_area, base = 10) %>% 
+  step_other(neighborhood, threshold = 0.01) %>% 
+  step_dummy(all_nominal_predictors()))
+
+```
+
+Now we'll explore potential interaction terms to include in the model by looking at the interaction between gross above-ground living area and building type- in other words, does the effect of gross above-ground living area have an effect on the sale price that's dependent on the type of building?
+
+```{r build type scatterplots}
+ggplot(ames_train, aes(gr_liv_area, sale_price)) + 
+  geom_point(alpha = 0.6) + 
+  geom_smooth(method = lm, formula = y ~ x) + 
+  scale_y_log10() + 
+  scale_x_log10() + 
+  facet_wrap(~ bldg_type) 
+```
+
+It looks like there is evidence of potential interactions between building type and the gross living area.  Importantly, to fit interaction terms between these two variables, one numeric and one categorical, dummy variables first need to be created, then the interaction step can be specified in the recipe.  Remember that order matters in the recipe.
+
+```{r add interaction term}
+(simple_ames_recipe <- recipe(
+  sale_price ~ neighborhood + gr_liv_area + year_built + bldg_type, 
+  data = ames_train
+) %>% 
+  step_log(gr_liv_area, base = 10) %>% 
+  step_other(neighborhood, threshold = 0.01) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_interact(~ gr_liv_area:starts_with("bldg_type_")))
+
+```
+
+There may be predictors that don't have a strict linear relationship with the outcome.  In these instances, fitting spline terms may be more appropriate, which allow the model to attempt to estimate the non-linear association.  We can explore adding spline terms for the non-linear association between latitude and the sale price.
+
+```{r explore spline terms}
+# Linear fit
+(p1 <- ggplot(ames_train, aes(latitude, sale_price)) + 
+  geom_point(alpha = 0.2) + 
+  geom_smooth(method = lm, formula = y ~ x) + 
+  labs(title = "Linear fit"))
+
+# Fit 3 spline terms
+spline_plots <- map(
+  c(2, 5, 20),
+  ~ ggplot(ames_train, aes(latitude, sale_price)) + 
+      geom_point(alpha = 0.2) + 
+      geom_smooth(method = lm, 
+                  formula = y ~ ns(x, df = .x)) + 
+      labs(title = paste0(.x, " spline terms")))
+
+(p1 + spline_plots[[1]]) / (spline_plots[[2]] + spline_plots[[3]])
+ 
+```
+
+If we wanted to add a step to reduce dimensionality in the data and extract information from correlated variables, we could use `step_pca()`.  It's important to note that this step assumes that all of the predictors are on the same scale; if they are not, a normalization step in the recipe will be needed before the PCA step.  
+
+Another important consideration is information leakage- if care is not taken, steps that are meant to pre-process and perform operations for feature selection on the training set may end up being used in the same way on the test set.  Recall, the test set is meant to be left as is, simulating new data drawn from the wild that the model has never seen.  Thus, any steps in the recipe that center and scale the data (i.e., taking the mean and subtracting the standard deviation) are performed on the training set only, and those values are then directly applied to the test data.  In other words, the mean and standard deviation are not re-calculated for the variable in the testing data.
+
+For other transformations, however, like transforming data onto the log scale, it is recommended to perform this step outside of the recipe.  This is because when a step is added to the recipe, it creates a new column in the training data only; that column does not exist in the new test data.  
+
+One important consideration for creating recipes in classification problems with high class imbalance- if downsampling is used on the majority class, that procedure should only be used on the modeling data, not on the test data used for prediction.  This is where the `skip` argument to the `step_()` functions comes in- when set to `TRUE`, the pre-processing procedure is strictly applied to the modeling data.  
+
+```{r create extended ames recipe}
+# Define recipe
+(ames_recipe <- recipe(
+  sale_price ~ neighborhood + gr_liv_area + year_built + bldg_type + 
+    latitude + longitude, data = ames_train
+) %>% 
+  step_log(gr_liv_area, base = 10) %>% 
+  step_other(neighborhood, threshold = 0.01, id = "my_id") %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_interact(~ gr_liv_area:starts_with("bldg_type_")) %>% 
+  step_ns(latitude, longitude, deg_free = 20))
+
+# Tidy the output
+tidy(ames_recipe)
+```
+
+Now refit the workflow.
+
+```{r workflow new}
+(lm_workflow <- workflow() %>% 
+  add_model(lm_mod) %>% 
+  add_recipe(ames_recipe))
+
+(lm_fit <- fit(lm_workflow, ames_train))
+
+```
+
+We can also include columns in the data that are helpful for identifying problematic or poorly fitted observations after the model is fitted.  To do this, we can use the function `update_role()`.
+
+```{r add role}
+ames_recipe$var_info
+```   
+
+Now save the recipe, workflow, and fit objects.
+
+```{r save objects}
+saveRDS(ames_recipe, "../data/ames_recipe.Rds")
+saveRDS(lm_workflow, "../data/ames_lm_workflow.Rds")
+saveRDS(lm_fit, "../data/ames_lm_fit.Rds")
+```
+
