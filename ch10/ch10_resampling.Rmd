@@ -1,0 +1,215 @@
+---
+title: "Ch10: Resampling"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Introduction
+
+Recall, the testing set of a model cannot be used during the training process; it is meant to simulate how well a model would perform using unseen data.  That means that we need to find a way to evaluate model performance before making predictions using the testing set.  This chapter focuses on how we accomplish this task using resampling.  
+
+```{r notebook setup}
+# Libraries 
+library(pacman)
+p_load(tidyverse, tidymodels, splines, broom, janitor)
+
+# Load data
+data(ames, package = "modeldata")
+ames <- ames %>% 
+  clean_names() %>% 
+  mutate(sale_price = log10(sale_price))
+
+# Split
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+# Load recipe, workflow, and model fit
+lm_workflow <- readRDS("../data/ames_lm_workflow.Rds")
+ames_recipe <- readRDS("../data/ames_recipe.Rds")
+lm_fit <- readRDS("../data/ames_lm_fit.Rds")
+```
+
+## Resubstitution 
+
+In the previous two chapters, we worked with the predictions from training a linear regression model.  Now we'll build another regression model using random forest.
+
+```{r random forest}
+# Define model specification
+rf_mod <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+# Build workflow
+(rf_workflow <- workflow() %>% 
+  add_formula(sale_price ~ neighborhood + gr_liv_area + year_built + 
+                bldg_type + latitude + longitude) %>% 
+  add_model(rf_mod))
+
+# Fit 
+(rf_fit <- fit(rf_workflow, ames_train))
+```
+
+Now we'll predict the training data (note, this is just used for demonstration to compare the two models).  
+
+```{r resubstitution error rate}
+# Build function to predict the training data
+estimate_perf <- function(model, dat) {
+  
+  cl <- match.call()
+  obj_name <- as.character(cl$model)
+  data_name <- as.character(cl$dat)
+  data_name <- gsub("ames_", "", data_name)
+  
+  # Estimate metric set
+  reg_metrics <- metric_set(rmse, rsq)
+  
+  # Predict training data and tidy selected metrics
+  out <- model %>% 
+    predict(dat) %>% 
+    bind_cols(dat %>% select(sale_price)) %>% 
+    reg_metrics(truth = sale_price, .pred) %>% 
+    select(-.estimator) %>% 
+    mutate(object = obj_name, data = data_name)
+  
+  return(out)
+
+}
+
+estimate_perf(rf_fit, ames_train) %>% 
+  bind_rows(estimate_perf(lm_fit, ames_train)) %>% 
+  arrange(.metric)
+
+```
+
+Based on the resubstitution error rate, the random forest model is better at predicting the training data compared to the ordinary least squares regression.  Now we'll evaluate how well the random forest model performs on the test data.
+
+```{r random forest test data}
+estimate_perf(rf_fit, ames_test)
+```
+
+Now we see that the RMSE is much higher and the coefficient of determination is lower- this is because the model did not generalize as well to new unseen data.  In this context, the random forest model has low bias, but higher variance.  For thoroughness, we can compute the same statistics for the ordinary least squares model on the test data.
+
+```{r linear model test data}
+estimate_perf(lm_fit, ames_test)
+
+```
+
+The RMSE and coefficient of determination are almost the same between the training and test sets- this is because although not as accurate on the training set (i.e., higher bias), ordinary least squares models tend to have lower variance compared to more flexible models like random forest.  
+
+## Resampling methods
+
+### Cross-validation
+
+Resampling methods further split the training data into analysis sets used to train and tune the model and assessment sets used to evaluate model performance.  The latter are almost like pseudo testing sets, but ensure that no data leakage occurs from the testing set into the model training process.
+
+One resampling method is cross-validation, called V-fold cross-validation in the textbook.  For each iteration, the data set is randomly split into V folds of relatively equal size.  V-1 folds are used for training and 1 fold is retained for assessment.  V iterations are performed such that for each iteration, a different fold is used as the holdout set, and the performance statistics are averaged over the V folds.  In general, 10-fold cross-validation is used, which is what we will use here.  In general, as the value of V decreases, bias increases and variance decreases; however, with larger values of V, bias decreases at the expense of an increase in variance.  
+
+```{r cross-validation}
+# Define folds
+set.seed(123)
+(ames_folds <- vfold_cv(ames_train, v = 10))
+
+# Each split element shows the sample size for the analysis and assessment sets
+ames_folds$splits[[1]] %>% 
+  analysis() %>% 
+  dim()
+```
+
+The Central Limit Theorem states that with repeated sampling, summary statistics will converge toward a normal distribution.  We can simulate sampling more data by performing repeat cross-validation, essentially by performing the V-fold cross-validation just described, repeated R times.  We can easily simulate repeated V-fold cross-validation using the `repeats` argument in the `vfold_cv()` call.
+
+```{r repeated cross-validation}
+vfold_cv(ames_train, v = 10, repeats = 5)
+
+```
+
+A slightly different flavor of V-fold cross-validation is Monte Carlo cross-validation, which randomly allocates a proportion of the data into assessment sets for each iteration.  Now we'll create a validation set, which is a partition of the training set.  
+
+```{r validation set}
+set.seed(123)
+(val_set <- validation_split(ames_train, prop = 0.7))
+
+```
+
+### Bootstrapping
+
+Another resampling method is the bootstrap, which entails redrawing samples at random from the original data set, with replacement, to create a new data set of the same size.  The analysis set is the new bootstrap data set; the assessment set, called the "out of bag," is composed of the training set samples that were not resampled in the analysis set.  Importantly, because the asssessment sets are composed of samples that were not resampled in the analysis set, and samples can be drawn more than once in the analysis set, the sizes of the assessment sets may vary. 
+
+In general, bootstrapping results in performance estimates with low variance, but higher bias. 
+
+```{r create bootstrap data set}
+bootstraps(ames_train, times = 10)
+```
+
+## Estimating performance
+
+All of the metrics discussed previously may be used to evaluate model performance in the assessment sets.  By default, the RMSE and coefficient of determination are the output metrics for regression models, while AUC and accuracy are output metrics for classification models.  Below we'll fit the random forest worfklow using 10-fold cross-validation and keep the predictions for each iteration of cross-validation.
+
+```{r cross-valiation random forest}
+# Set control to keep all predictions
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+
+# Fit resamples
+set.seed(130)
+(rf_res <- rf_workflow %>% 
+  fit_resamples(resamples = ames_folds, control = keep_pred))
+
+# Look at the mean performance metrics across folds
+collect_metrics(rf_res, summarize = TRUE)
+```
+
+```{r collect predictions}
+(assessment_res <- collect_predictions(rf_res))
+
+# Plot against true outcome
+ggplot(assessment_res, aes(sale_price, .pred)) + 
+  geom_abline(linetype = "dashed", color = "red") + 
+  geom_point(alpha = 0.2) + 
+  coord_obs_pred() + 
+  labs(x = "Sale price (log10)", 
+       y = "Predicted sale price (log10)")
+
+
+```
+
+This is a helpful strategy for identifying predictions that were way off from the model.  Looking at the scatterplot, there appear to be one or two houses that have a low sale price but were overpredicted by the model.  We can find out which ones these are by looking at the the residuals, or the difference between the actual sale price and the predicted value.
+
+```{r find poorly predicted homes}
+# Isolate over-predicted data 
+(over_predicted <- assessment_res %>% 
+  mutate(residual = sale_price - .pred) %>% 
+  arrange(desc(abs(residual))) %>% 
+  slice(1:2))
+
+# Look at variables from original data set
+ames_train %>% 
+  slice(over_predicted$.row) %>% 
+  select(gr_liv_area, neighborhood, year_built, bedroom_abv_gr, full_bath)
+```
+```{r use validation set}
+(val_res <- rf_workflow %>% 
+  fit_resamples(resamples = val_set))
+
+collect_metrics(val_res)
+```
+
+The results from the resampling are correlated with the results from the validation set.  In the textbook, the authors recommend repeating the process and setting a different seed for the pseudo random number generation.  After setting the seet from `55` to `123`, the results are largely the same, demonstrating the power of resampling methods to estimate how well a model may perform when it sees new data.
+
+## Parallel processing
+
+Since each resampled data set is independent of the next, the model training process can be parallelized using the `doMC` package.  The `fit_resamples()` function requires that the user register parallel cores to be used before fitting the models.  
+
+## Saving resampled objects
+
+If desired, the models fitted to resampled data sets can be saved and extracted.  This could be interesting to see how the model coefficients and other metrics change for each resample, but by default, these typically aren't retained because they're just being used to evaluate performance.  
+
+```{r save objects}
+# Save folds, predictions, and random forest results
+
+
+```
+
