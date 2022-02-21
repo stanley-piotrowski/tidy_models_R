@@ -1,0 +1,238 @@
+---
+title: "Ch11: Comparing models with resampling"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Introduction 
+
+This chapter focuses on how we can use resampling to evaluate different models on the same data set and select the optimal choice for prediction.
+
+```{r notebook setup}
+# Libraries and data
+library(pacman)
+p_load(tidyverse, tidymodels, broom, splines, janitor, patchwork, 
+       tidyposterior, rstanarm)
+
+data(ames, package = "modeldata")
+ames <- ames %>% 
+  clean_names() %>% 
+  mutate(sale_price = log10(sale_price))
+
+# Split and read workflows
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+lm_workflow <- readRDS("../data/ames_lm_workflow.Rds")
+lm_fit <- readRDS("../data/ames_lm_fit.Rds")
+ames_recipe <- readRDS("../data/ames_recipe.Rds")
+```
+
+## Creating multiple models
+
+Instead of re-using the same full recipe from the previous chapters that included the interactions and spline terms, we can build three separate model recipes, push them into a list, build the workflow, and then fit each of them to evaluate the performance of each. 
+
+```{r create multiple models}
+# Define model specification
+(lm_model <- linear_reg() %>% 
+  set_engine("lm"))
+
+# Split for cross-validation
+set.seed(123)
+(ames_folds <- vfold_cv(ames_train, v = 10))
+
+# Build recipes
+(basic_recipe <- recipe(
+  sale_price ~ neighborhood + gr_liv_area + year_built + bldg_type + 
+    latitude + longitude, data = ames_train) %>% 
+  step_log(gr_liv_area, base = 10) %>% 
+  step_other(neighborhood, threshold = 0.01) %>% 
+  step_dummy(all_nominal_predictors()))
+
+(interaction_recipe <- basic_recipe %>% 
+  step_interact(~ gr_liv_area:starts_with("bldg_type_")))
+
+(spline_recipe <- interaction_recipe %>% 
+  step_ns(latitude, longitude, deg_free = 50))
+
+# Build preprocessing list
+preprocess <- list(
+  basic = basic_recipe, 
+  interaction = interaction_recipe,
+  spline = spline_recipe
+)
+
+# Build workflow set
+(lm_models <- workflow_set(
+  preproc = preprocess, 
+  models = list(lm = lm_model), 
+  cross = FALSE
+))
+```
+
+Now we'll fit the models using `workflow_map()`, passing the same seed to each of the three workflows in the set and defining the resampling object.  
+
+```{r fit workflow set}
+# Define control rule
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+
+# Fit models
+(lm_models <- lm_models %>% 
+  workflow_map(
+    "fit_resamples", 
+    seed = 1101, verbose = TRUE, 
+    resamples = ames_folds, 
+    control =  keep_pred
+  ))
+
+# Extract RMSE
+collect_metrics(lm_models) %>% 
+  filter(.metric == "rmse") %>% 
+  arrange(mean)
+  
+```
+
+The model with the spline term included has the lowest RMSE.  Now we should see how these compare to the random forest model results.  
+
+```{r evaluate four models}
+# Define random forest model specification
+rf_mod <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+# Build workflow
+(rf_workflow <- workflow() %>% 
+  add_formula(sale_price ~ neighborhood + gr_liv_area + year_built + 
+                bldg_type + latitude + longitude) %>% 
+  add_model(rf_mod))
+
+# Fit
+set.seed(123)
+(rf_res <- rf_workflow %>% 
+  fit_resamples(resamples = ames_folds, control = keep_pred))
+
+# Combine four models
+(four_models <- as_workflow_set(random_forest = rf_res) %>% 
+    bind_rows(lm_models))
+
+# Plot RMSE and coefficient of determination
+autoplot(four_models, metric = "rsq") / 
+  autoplot(four_models, metric = "rmse") + 
+  plot_layout(guides = "collect")
+```
+
+The `autoplot()` shows the point estimate across the resamples and the confidence intervals.  The first plot shows the coefficient of determination, which is maximized with the random forest model.
+
+## Resampled performance statistics
+
+It's important to keep in mind the resample-to-resample component of variation, which describes the correlation between statistics computed on the same resample across different models.  In other words, some resamples will have low statistics for all models; others will have the opposite.  
+
+We can formally test for within-resample correlations using `cor.test()`.
+
+```{r within-resample cor test}
+# Compute all r-squared statistics across models
+(rsq_ind_estimates <- collect_metrics(four_models, summarize = FALSE) %>% 
+  filter(.metric == "rsq"))
+
+# Re-format 
+(rsq_wider <- rsq_ind_estimates %>% 
+  select(wflow_id, .estimate, id) %>% 
+  pivot_wider(id_cols = "id", names_from = "wflow_id", 
+              values_from = ".estimate"))
+
+# Correlation test
+rsq_wider %>% 
+  with( cor.test(basic_lm, spline_lm) ) %>% 
+  tidy() %>% 
+  select(estimate, starts_with("conf"))
+```
+
+The confidence interval doesn't overlap zero, so the within-resample correlation seems real and will have a substantial influence in comparing variance between two models. In practice, it helps to define a threshold for deciding meaningful effect sizes for the difference in variance explained by two models (e.g., 2%).
+
+## Simple hypothesis testing methods
+
+We can use a standard ANOVA approach to compare the coefficient of determination between two models.
+
+```{r compare two models}
+(compare_lm <- rsq_wider %>% 
+  mutate(difference = spline_lm - basic_lm))
+
+# Build ANOVA
+lm(difference ~ 1, data = compare_lm) %>% 
+  tidy(conf.int = TRUE) %>% 
+  select(estimate, p.value, starts_with("conf"))
+
+```
+
+Here's how we would interpret these results-- the addition of the spline terms for latitude and longitude had a statistically significant increase in the coefficient of determination, or the variance in the data explained by the model.  However, practically, we probably won't consider this model because the estimate of the increase in the coefficient of determination is only about 0.8%.  
+
+## Bayesian methods
+
+Bayesian methods make additional probabilistic assumptions about the data, notably including a prior distribution for each of the variables.  In general, if we included a prior with a relatively large standard deviation, this would give the information more influence in determining the estimated coefficients.  In this example, we'll fit a random intercept model, which essentially assumes parallel effects of the resampled statistics, just with different intercept terms. 
+
+The `tidyposterior` package can be used to fit these types of Bayesian models that will behave slightly differently and make either between-model or within-model comparisons, depending on how the workflow set is constructed.  For example, for different models, the Bayesian model will make between-model comparisons; for a single model with different tuning parameters, the Bayesian model will make within-model comparisons. 
+
+```{r}
+# Fit the Bayesian anova model
+rsq_anova <- perf_mod(
+  four_models, 
+  metric = "rsq", 
+  prior_intercept = rstanarm::student_t(df = 1), # set wider distribution
+  chains = 4, 
+  iter = 5000,
+  seed = 1102
+)
+
+# Take random sample from the posterior distribution
+model_post <- rsq_anova %>% 
+  tidy(seed = 1103)
+
+# Visualize four posteriors
+model_post %>% 
+  mutate(model = forcats::fct_inorder(model)) %>% 
+  ggplot(aes(posterior, fill = model)) + 
+  geom_histogram(bins = 50, color = "white", alpha = 0.5) + 
+  facet_wrap(~ model, nrow = 4) +
+  theme(legend.position = "none") + 
+  labs(x = "Posterior for mean coefficient of determination")
+  
+```
+
+Now we can see the posterior for the mean coefficient of determination for each of the models.  There is some overlap for the linear models, but the mean value for the random forest model is clearly higher.  We can also now use the `contrast_models()` function to compute the posterior of the difference in means between two models to evaluate the increase or decrease in model performance with the inclusion of additional model terms.  The function randomly samples from the individual posteriors from two models and computes the difference.  The distribution of the differences can then be visualized with a histogram.
+
+```{r contrast models}
+rsq_diff <- contrast_models(
+  rsq_anova, 
+  list_1 = "spline_lm", 
+  list_2 = "basic_lm",
+  seed = 1103
+)
+
+rsq_diff %>% 
+  as_tibble() %>% 
+  ggplot(aes(difference)) + 
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_histogram(bins = 50, color = "white", alpha = 0.4)
+```
+
+```{r summary of posterior}
+summary(rsq_diff) %>% 
+  select(-starts_with("pract"))
+
+```
+
+The `probability` field is the proportion of the sampled values from the posterior that is greater than 0- in this case, it is nearly 1, so we can  conclude that the effect is statistically signficant.  However, practically, the mean difference is still around 0.8, exactly what was computed previously using frequentist methods.  We can also formally test this using the region of practical equivalence estimate below, using a threshold of 2% (i.e., in order to be significant, we need to see at least a 2% increase in the mean summary statistic).
+
+```{r ROPE analysis}
+summary(rsq_diff, size = 0.02) %>% 
+  select(starts_with("pract"))
+
+```
+According to the documentation for `summary.posterior_diff()`, the `pract_equiv` column in the results shows the area under the curve between -size and +size-- if this value is close to 1 (it's practically 1 here), then the two models under comparison are not practically different relative to the size specified.  
+
+
