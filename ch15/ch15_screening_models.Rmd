@@ -1,0 +1,224 @@
+---
+title: "Ch15: Screening many models"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Introduction
+
+This chapter focuses on the process of screening many models.  Early in a project where you may not have much of an idea of which methods will perform best on a particular data set, it is helpful to screen many different types of models.  Once you've found a few that perform well, you can invest more time in fine-tuning. 
+
+For this chapter, we'll use the `concrete` data to predict the strength of concrete using the ingredients as the predictors.
+
+```{r notebook setup}
+# Libraries
+library(pacman)
+p_load(tidyverse, tidymodels, rules, baguette, finetune, kknn, xgboost, Cubist)
+
+# Load concrete data
+data(concrete, package = "modeldata")
+
+# Compute mean compressive strength for cases where the formula was tested multiple times
+concrete <- concrete %>% 
+  group_by(across(-compressive_strength)) %>% 
+  summarise(compressive_strength = mean(compressive_strength), 
+            .groups = "drop")
+```
+
+## Prepare concrete data
+
+```{r prepare splits}
+# Use default 3/4 split 
+set.seed(1501)
+concrete_split <- initial_split(concrete, strata = compressive_strength)
+concrete_train <- training(concrete_split)
+concrete_test <- testing(concrete_split)
+
+# Create 10-fold cross-validation sets with 5 repeats
+set.seed(1502)
+concrete_folds <- vfold_cv(
+  concrete_train, 
+  strata = compressive_strength, 
+  repeats = 5
+)
+```
+
+```{r define recipes}
+# Define normalized recipe to center and scale all numeric predictors
+(normalized_recipe <- recipe(compressive_strength ~ ., data = concrete_train) %>%
+  step_normalize(all_predictors()))
+
+# Define recipe to add polynomials and interaction terms
+(poly_recipe <- recipe(compressive_strength ~ ., data = concrete_train) %>% 
+  step_poly(all_predictors()) %>% 
+  step_interact(~ all_predictors():all_predictors()))
+```
+
+```{r create model specs}
+# Linear regression
+# Mixture controls the relative amount of the penalty
+(linear_reg_spec <- linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet"))
+
+# Neural net 
+neural_net_spec <- mlp(
+  hidden_units = c(1, 27), penalty = tune(), epochs = tune()) %>% 
+  set_engine("nnet", MaxNWts = 2600) %>% 
+  set_mode("regression")
+
+# MARS model-- this is a flexible model that uses splines to automatically determine non-linear relationships across ranges of the predictors
+mars_spec <- mars(prod_degree = tune()) %>% 
+  set_engine("earth") %>% 
+  set_mode("regression")
+
+# Radial basis SVM
+svm_rbf_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+# Polynomial function SVM
+svm_poly_spec <- svm_poly(cost = tune(), degree = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+# KNN
+# The dist power function controls which distance parameter is used
+knn_spec <- nearest_neighbor(neighbors = tune(), dist_power = tune(), 
+                             weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression")
+
+# Random forest 
+rand_forest_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%   set_engine("ranger") %>% 
+  set_mode("regression")
+
+# CART model-- decision trees
+cart_spec <- decision_tree(cost_complexity = tune(), min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")
+
+# Bagged decision tree
+bag_tree_spec <- bag_tree() %>% 
+  set_engine("rpart", times = 50L) %>% 
+  set_mode("regression")
+
+# Gradient boost
+xgb_spec <- boost_tree(tree_depth = tune(), learn_rate = tune(), 
+                       loss_reduction = tune(), min_n = tune(), 
+                       sample_size = tune(), trees = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+# Cubist rule-based
+cubist_spec <- cubist_rules(committees = tune(), neighbors = tune()) %>% 
+  set_engine("Cubist")
+```
+
+## Creating the workflow set
+
+Now we need to combine the pre-processors for the normalized recipe and the poly recipe, along with all of the different models bundle them into a workflow set.
+
+```{r define workflow set}
+# Normalized
+normalized_workflow <- workflow_set(
+  preproc = list(normalized = normalized_recipe), 
+  models = list(
+    SVM_radial = svm_rbf_spec, 
+    SVM_poly = svm_poly_spec, 
+    KNN = knn_spec, 
+    neutral_network = neural_net_spec
+  )
+)
+
+# Create workflow set for outcome and predictors
+model_vars <- workflow_variables(
+  outcomes = compressive_strength, 
+  predictors = everything()
+)
+
+# Define no pre-processing workflow
+(no_pre_process <- workflow_set(
+  preproc = list(simple = model_vars), 
+  models = list(
+    MARS = mars_spec, 
+    CART = cart_spec, 
+    CART_bagged = bag_tree_spec, 
+    RF = rand_forest_spec, 
+    boosting = xgb_spec, 
+    Cubist = cubist_spec
+  )
+))
+
+# Non-linear terms and interactions
+with_features_workflow <- workflow_set(
+  preproc = list(full_quad = poly_recipe), 
+  models = list(
+    linear_reg = linear_reg_spec, 
+    KNN = knn_spec
+  )
+)
+
+# Bind all workflow sets
+(all_workflows <- bind_rows(no_pre_process, 
+                            normalized_workflow, 
+                            with_features_workflow) %>% 
+    mutate(wflow_id = gsub("(simple_)|(normalized_)", "", wflow_id)))
+```
+
+## Tuning and evaluating models
+
+Instead of fitting using regular approach first presented in the textbook, I'm going to use the racing method to speed up computation.
+
+```{r race control results}
+# Race control
+race_control <- control_race(
+  save_pred = TRUE,
+  parallel_over = "everything", 
+  save_workflow = TRUE
+)
+
+# Map the workflows over the cross-validation sets
+race_results <- all_workflows %>% 
+  workflow_map(
+    "tune_race_anova",
+    seed = 1503, 
+    resamples = concrete_folds, 
+    grid = 25, # set grid size of 25 
+    control = race_control, 
+    verbose = TRUE
+  )
+```
+
+The R session keeps running into errors trying to run all models, so we'll just extract the xgboost model and the optimal parameters from the textbook, finalize the workflow, fit the model on the full training data and make predictions.
+
+```{r final fit}
+# Define xgboost specification and recipe manually
+xgb_spec <- boost_tree(tree_depth = 15, learn_rate = 0.0880, 
+                       loss_reduction = 0.000089, min_n = 31, 
+                       sample_size = 0.542, trees = 1320) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgboost_recipe <- recipe(compressive_strength ~ ., 
+                         data = concrete_train)
+
+# Define workflow and fit
+(boosting_test_res <- workflow() %>% 
+  add_model(xgb_spec) %>% 
+  add_recipe(xgboost_recipe) %>% 
+  last_fit(split = concrete_split))
+
+# Collect metrics and visualize
+collect_metrics(boosting_test_res)
+
+boosting_test_res %>% 
+  collect_predictions() %>% 
+  ggplot(aes(compressive_strength, .pred)) + 
+  geom_abline(linetype = "dashed") + 
+  geom_point(alpha = 0.5) + 
+  coord_obs_pred()
+```
+
