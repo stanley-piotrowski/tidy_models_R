@@ -1,0 +1,152 @@
+---
+title: "Ch13: Grid search"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+## Introduction 
+
+This chapter focuses on using the grid search method to evaluate a number of hyperparameter values a priori.  
+
+```{r notebook setup}
+library(pacman)
+p_load(tidyverse, tidymodels, broom, splines, janitor, patchwork, 
+       tidyposterior, rstanarm)
+
+tidymodels_prefer()
+
+data(ames, package = "modeldata")
+ames <- ames %>% 
+  clean_names() %>% 
+  mutate(sale_price = log10(sale_price))
+
+# Split and read workflows
+set.seed(123)
+ames_split <- initial_split(ames, prop = 0.8, strata = sale_price)
+ames_train <- training(ames_split)
+ames_test <- testing(ames_split)
+
+lm_workflow <- readRDS("../data/ames_lm_workflow.Rds")
+lm_fit <- readRDS("../data/ames_lm_fit.Rds")
+ames_recipe <- readRDS("../data/ames_recipe.Rds")
+```
+
+## Regular and non-regular grids
+
+Regular grids are combinations of separate sets of values.  These can easily be creating using `crossing()`.  One of the benefits of this strategy is that we can easily see the relationships between the different variables and their combinations.  
+
+```{r crossing example}
+crossing(
+  hidden_units = 1:3,
+  penalty = c(0.0, 0.1), 
+  epochs = c(100, 200)
+)
+
+```
+
+Irregular grids can also be used and include more complex designs to balance the need to explore sufficient parameter space while minimizing overlapping values.
+
+## Evaluating the grid
+
+In order to values in the tuning process, we need to use subsets of the data that were not used for training-- that is, we need quasi holdout sets, or the assessment sets created in the validation split.  We'll use the `cells` data set, which consists of imaging measurements on breast cancer cells.  
+
+```{r cells data}
+# Load data
+data(cells)
+(cells <- cells %>% select(-case))
+
+# Split for 10-fold cross-validation
+set.seed(33)
+(cell_folds <- vfold_cv(cells))
+
+# Create the recipe
+# First, we'll use a Yeo-Johnson transformation to make distributions more symmetrical
+# Then, we'll normalize all numeric predictors, 
+# Conduct PCA for feature extraction, 
+# And finally normalize all features again
+mlp_recipe <- recipe(class ~ ., data = cells) %>% 
+  step_YeoJohnson(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), num_comp = tune()) %>% # tune n PCs to retain
+  step_normalize(all_numeric_predictors())
+
+# Build multi-layer perceptron model spec
+mlp_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+  set_engine("nnet", trace = 0) %>% 
+  set_mode("classification")
+
+# Build the workflow
+(mlp_workflow <- workflow() %>% 
+  add_model(mlp_spec) %>% 
+  add_recipe(mlp_recipe))
+
+
+```
+
+```{r update workflow}
+(mlp_param <- mlp_workflow %>% 
+   parameters() %>% 
+   update(epochs = epochs(c(50, 200)), 
+          num_comp = num_comp(c(0, 40)))
+)
+```
+
+```{r tune}
+# Define metric set
+(roc_res <- metric_set(roc_auc))
+
+# Tune
+set.seed(99)
+(mlp_reg_tune <- mlp_workflow %>% 
+    tune_grid(
+      cell_folds, 
+      grid = mlp_param %>% grid_regular(levels = 3), 
+      metrics = roc_res)
+)
+
+# Plot 
+autoplot(mlp_reg_tune) +
+  theme(legend.position = "top")
+
+```
+
+```{r get best tuning combinations}
+show_best(mlp_reg_tune) %>% select(-.estimator)
+```
+
+## Finalizing the model
+
+If we want to use the best parameters from the tuning, we can use `select_best()` and finalize the model formula.
+
+```{r finalize workflow}
+# Create tibble of parameters
+select_best(mlp_reg_tune, metric = "roc_auc")
+
+logistic_param <- tibble(
+  num_comp = 0, 
+  epochs = 125, 
+  hidden_units = 1, 
+  penalty = 1
+)
+
+# Finalize workflow
+(final_mlp_workflow <- mlp_workflow %>% 
+  finalize_workflow(logistic_param))
+
+```
+
+```{r fit final model}
+# Note, fit final model to the entire training set
+(final_mlp_fit <- final_mlp_workflow %>% 
+  fit(cells))
+
+```
+
+## Tools for efficient grid search
+
+By default, the `tune_()` functions can parallelize over the resamples, not the different configurations of the model tuning parameters.  However, we can achieve the desired effect to loop over both the resamples and the tuning configurations using `crossing()`.  However, the potential downside here is that if the splitting of the data and the pre-processing steps are computationally expensive, the process may slow considerably.  The other downside with the latter method is that work is repeated (i.e., the same computations are performed multiple times).  
+
+Another approach that may speed up computation is the racing method.  Essentially, a subset of models are fit using different parameter combinations, instead of waiting until all resamples have been fitted to tune.  The racing method computes a quasi interim analysis such that combinations of parameters that are performing poorly, or not statistically different from the best result, are discarded.  The parameters that are considered will continue to be resampled.  
